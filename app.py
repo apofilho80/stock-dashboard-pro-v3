@@ -786,32 +786,40 @@ def iv_decision_engine(trend, iv_percentile, near_earnings=False):
 
 @st.cache_data(ttl=900)
 def fetch_iv_data_yahoo(ticker):
+    """
+    Returns current near-the-money implied volatility from Yahoo option chains.
+
+    Important:
+    yfinance does not provide a reliable 1-year historical implied-volatility series.
+    Therefore, IV Rank and IV Percentile below are PROXIES:
+      1. Preferred proxy: current option IV compared with 1-year rolling 30-day realized volatility.
+      2. Fallback proxy: current option IV compared with the current option term structure.
+    """
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
 
+        base_empty = {
+            "implied_volatility": None,
+            "iv_percentile_approx": None,
+            "iv_regime": "N/A",
+            "iv_note": "No option expirations available from Yahoo.",
+            "iv_history_proxy": [],
+            "iv_rank_proxy": None,
+            "iv_percentile_proxy": None,
+        }
+
         if not expirations:
-            return {
-                "implied_volatility": None,
-                "iv_percentile_approx": None,
-                "iv_regime": "N/A",
-                "iv_note": "No option expirations available from Yahoo",
-                "iv_history_proxy": []
-            }
+            return base_empty
 
-        hist = tk.history(period="5d")
-        if hist.empty:
-            return {
-                "implied_volatility": None,
-                "iv_percentile_approx": None,
-                "iv_regime": "N/A",
-                "iv_note": "No recent price available for IV calculation",
-                "iv_history_proxy": []
-            }
+        hist_recent = tk.history(period="5d")
+        if hist_recent is None or hist_recent.empty:
+            base_empty["iv_note"] = "No recent price available for IV calculation."
+            return base_empty
 
-        spot = float(hist["Close"].iloc[-1])
+        spot = float(hist_recent["Close"].dropna().iloc[-1])
 
-        def _representative_iv_from_chain(chain_df, spot_price):
+        def representative_iv_from_chain(chain_df, spot_price):
             if chain_df is None or chain_df.empty:
                 return None
 
@@ -819,73 +827,124 @@ def fetch_iv_data_yahoo(ticker):
                 return None
 
             df = chain_df.copy()
-            df = df[
-                df["strike"].notna() &
-                df["impliedVolatility"].notna()
-            ].copy()
-
-            df = df[
-                (df["impliedVolatility"] >= 0.05) &
-                (df["impliedVolatility"] <= 3.00)
-            ].copy()
+            df = df[df["strike"].notna() & df["impliedVolatility"].notna()].copy()
+            df = df[(df["impliedVolatility"] >= 0.05) & (df["impliedVolatility"] <= 3.00)].copy()
 
             if df.empty:
                 return None
 
             df["moneyness_pct"] = (df["strike"] - spot_price).abs() / spot_price
+            near_atm = df[df["moneyness_pct"] <= 0.10].copy()
 
-            near = df[df["moneyness_pct"] <= 0.10].copy()
+            if len(near_atm) < 4:
+                near_atm = df.sort_values("moneyness_pct").head(10).copy()
 
-            if len(near) < 4:
-                near = df.sort_values("moneyness_pct").head(10).copy()
-
-            if near.empty:
+            if near_atm.empty:
                 return None
 
-            return float(near["impliedVolatility"].median())
+            return float(near_atm["impliedVolatility"].median())
 
+        # ----------------------------------------------------
+        # Current near-term ATM IV
+        # ----------------------------------------------------
         nearest_exp = expirations[0]
         chain = tk.option_chain(nearest_exp)
 
-        call_iv = _representative_iv_from_chain(chain.calls, spot)
-        put_iv = _representative_iv_from_chain(chain.puts, spot)
-
+        call_iv = representative_iv_from_chain(chain.calls, spot)
+        put_iv = representative_iv_from_chain(chain.puts, spot)
         iv_candidates = [x for x in [call_iv, put_iv] if x is not None]
         implied_volatility = float(np.median(iv_candidates)) if iv_candidates else None
 
+        # ----------------------------------------------------
+        # Term-structure proxy from current available expirations
+        # ----------------------------------------------------
         iv_history_proxy = []
         for exp in expirations[:8]:
             try:
                 ch = tk.option_chain(exp)
-                c_iv = _representative_iv_from_chain(ch.calls, spot)
-                p_iv = _representative_iv_from_chain(ch.puts, spot)
-
+                c_iv = representative_iv_from_chain(ch.calls, spot)
+                p_iv = representative_iv_from_chain(ch.puts, spot)
                 vals = [x for x in [c_iv, p_iv] if x is not None]
                 if vals:
                     iv_history_proxy.append(float(np.median(vals)))
             except Exception:
                 continue
 
-        iv_percentile_approx = None
-        if implied_volatility is not None and len(iv_history_proxy) >= 3:
-            arr = np.array(sorted(iv_history_proxy))
-            iv_percentile_approx = float((arr < implied_volatility).sum() / len(arr) * 100)
+        # ----------------------------------------------------
+        # Better fallback: 1-year rolling 30-day realized volatility
+        # ----------------------------------------------------
+        rv_history = []
+        try:
+            hist_1y = tk.history(period="1y")
+            if hist_1y is not None and not hist_1y.empty and "Close" in hist_1y.columns:
+                close = hist_1y["Close"].dropna()
+                returns = np.log(close / close.shift(1)).dropna()
+                rolling_rv = returns.rolling(30).std() * np.sqrt(252)
+                rv_history = rolling_rv.dropna().tolist()
+        except Exception:
+            rv_history = []
+
+        iv_rank_proxy = None
+        iv_percentile_proxy = None
+        proxy_basis = None
+
+        # Preferred proxy: current option IV vs one-year realized volatility range
+        if implied_volatility is not None and len(rv_history) >= 30:
+            rv_low = min(rv_history)
+            rv_high = max(rv_history)
+
+            if rv_high > rv_low:
+                iv_rank_proxy = ((implied_volatility - rv_low) / (rv_high - rv_low)) * 100
+                iv_rank_proxy = max(0, min(100, iv_rank_proxy))
+
+            days_below = sum(1 for rv in rv_history if rv < implied_volatility)
+            iv_percentile_proxy = (days_below / len(rv_history)) * 100
+            proxy_basis = "1-year rolling 30-day realized volatility"
+
+        # Fallback proxy: current option IV vs current term structure
+        if iv_rank_proxy is None and implied_volatility is not None and len(iv_history_proxy) >= 3:
+            iv_low = min(iv_history_proxy)
+            iv_high = max(iv_history_proxy)
+
+            if iv_high > iv_low:
+                iv_rank_proxy = ((implied_volatility - iv_low) / (iv_high - iv_low)) * 100
+                iv_rank_proxy = max(0, min(100, iv_rank_proxy))
+
+            days_below = sum(1 for x in iv_history_proxy if x < implied_volatility)
+            iv_percentile_proxy = (days_below / len(iv_history_proxy)) * 100
+            proxy_basis = "current option expiration term structure"
+
+        if proxy_basis is None:
+            note = (
+                "Implied volatility is estimated from near-the-money calls and puts. "
+                "IV Rank Proxy and IV Percentile Proxy are unavailable because there was not enough comparison history."
+            )
+        else:
+            note = (
+                "Implied volatility is estimated from near-the-money calls and puts. "
+                f"IV Rank Proxy and IV Percentile Proxy compare current option IV with {proxy_basis}. "
+                "This is a proxy, not true 1-year historical implied volatility."
+            )
 
         return {
             "implied_volatility": implied_volatility,
-            "iv_percentile_approx": iv_percentile_approx,
+            "iv_percentile_approx": iv_percentile_proxy,
             "iv_regime": classify_iv(implied_volatility),
-            "iv_note": "Implied volatility is estimated from near-the-money calls and puts; IV percentile is experimental and based on available expirations, not 1-year historical IV",
-            "iv_history_proxy": iv_history_proxy
+            "iv_note": note,
+            "iv_history_proxy": iv_history_proxy,
+            "iv_rank_proxy": iv_rank_proxy,
+            "iv_percentile_proxy": iv_percentile_proxy,
         }
 
-    except Exception:
+    except Exception as e:
         return {
             "implied_volatility": None,
             "iv_percentile_approx": None,
             "iv_regime": "N/A",
-            "iv_note": "Yahoo options data unavailable",
-            "iv_history_proxy": []
+            "iv_note": f"Yahoo options data unavailable: {e}",
+            "iv_history_proxy": [],
+            "iv_rank_proxy": None,
+            "iv_percentile_proxy": None,
         }
 
 
@@ -1305,8 +1364,8 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
     iv_data = fetch_iv_data_yahoo(ticker)
 
     iv_history_proxy = iv_data.get("iv_history_proxy", [])
-    iv_rank = compute_iv_rank_from_history(iv_data.get("implied_volatility"), iv_history_proxy)
-    iv_percentile_engine = compute_iv_percentile_from_history(iv_data.get("implied_volatility"), iv_history_proxy)
+    iv_rank = iv_data.get("iv_rank_proxy")
+    iv_percentile_engine = iv_data.get("iv_percentile_proxy")
 
     near_earnings = False
     try:
@@ -1626,15 +1685,19 @@ with tab_valuation:
         st.divider()
 
         st.subheader("Manual Ratio Fallback Audit")
+        st.caption("This table shows the raw inputs used to calculate missing ratios when APIs do not provide them.")
 
-        fallback_audit = result.get("fallback_audit", pd.DataFrame())
+        audit_table = result.get("audit_table", pd.DataFrame())
 
-        if fallback_audit is not None and not fallback_audit.empty:
-            st.dataframe(fallback_audit, use_container_width=True, hide_index=True)
+        if audit_table is not None and not audit_table.empty:
+            st.dataframe(audit_table, use_container_width=True, hide_index=True)
         else:
             st.info("Manual Ratio Fallback Audit is not available for this ticker.")
 
-
+        if result.get("data_notes"):
+            with st.expander("Calculation Notes"):
+                for note in result["data_notes"]:
+                    st.write(f"- {note}")
 
 with tab_options:
     if result is None:
@@ -1657,11 +1720,11 @@ with tab_options:
             "N/A" if result["implied_volatility"] is None else f"{result['implied_volatility'] * 100:.1f}%"
         )
         iv2.metric(
-            "IV Rank (Approx.)",
+            "IV Rank Proxy",
             "N/A" if result["iv_rank"] is None else f"{result['iv_rank']:.0f}"
         )
         iv3.metric(
-            "IV Percentile (Approx.)",
+            "IV Percentile Proxy",
             "N/A" if result["iv_percentile_engine"] is None else f"{result['iv_percentile_engine']:.0f}"
         )
 
