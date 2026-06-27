@@ -1626,7 +1626,12 @@ with tab_valuation:
         st.divider()
 
         st.subheader("Manual Ratio Fallback Audit")
-        st.dataframe(result["fallback_audit"], use_container_width=True, hide_index=True)
+        fallback_audit = result.get("fallback_audit", pd.DataFrame())
+
+if fallback_audit is not None and not fallback_audit.empty:
+    st.dataframe(fallback_audit, use_container_width=True, hide_index=True)
+else:
+    st.info("Manual Ratio Fallback Audit is not available for this ticker.")
 
 
 
