@@ -1614,21 +1614,21 @@ with tab_valuation:
     if result is None:
         st.info("Run Analysis to view valuation.")
     else:
-        st.subheader("Fundamentals Table")
-        st.dataframe(result["fundamentals"], use_container_width=True, hide_index=True)
-
         st.subheader("EV / EBITDA Relative View")
         st.write(f"**Status:** {result['ev_rel']['status']}")
         st.write(f"**Comparison:** {result['ev_rel']['comparison']}")
 
-        st.subheader("Manual Ratio Fallback Audit")
-        st.caption("This table shows the raw inputs used to calculate missing ratios when APIs do not provide them.")
-        st.dataframe(result["audit_table"], use_container_width=True, hide_index=True)
+        st.divider()
 
-        if result.get("data_notes"):
-            with st.expander("Calculation Notes"):
-                for note in result["data_notes"]:
-                    st.write(f"- {note}")
+        st.subheader("Fundamentals Table")
+        st.dataframe(result["fundamentals"], use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.subheader("Manual Ratio Fallback Audit")
+        st.dataframe(result["fallback_audit"], use_container_width=True, hide_index=True)
+
+
 
 with tab_options:
     if result is None:
