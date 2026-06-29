@@ -141,6 +141,68 @@ def first_list_item(data):
     return {}
 
 
+def get_statement_value(statement_df, possible_rows):
+    """Extract the most recent numeric value from a Yahoo Finance statement table."""
+    try:
+        if statement_df is None or statement_df.empty:
+            return None
+        for row_name in possible_rows:
+            if row_name in statement_df.index:
+                row = statement_df.loc[row_name]
+                if isinstance(row, pd.Series):
+                    row = row.dropna()
+                    if len(row) > 0:
+                        return to_float(row.iloc[0])
+                else:
+                    return to_float(row)
+    except Exception:
+        return None
+    return None
+
+
+def get_json_first(urls):
+    """Try a list of URLs and return the first valid list/dict item."""
+    for url in urls:
+        data = fetch_json(url)
+        item = first_list_item(data)
+        if item:
+            return item
+    return {}
+
+
+def get_json_list(urls):
+    """Try a list of URLs and return the first valid list."""
+    for url in urls:
+        data = fetch_json(url)
+        if isinstance(data, list) and len(data) > 0:
+            return data
+    return []
+
+
+def valid_enterprise_value(enterprise_value, market_cap):
+    """Reject enterprise values that are obviously mis-scaled vs market cap."""
+    ev = to_float(enterprise_value)
+    mc = to_float(market_cap)
+    if ev is None:
+        return None
+    if mc is not None and mc > 0:
+        # If EV is wildly smaller/larger than market cap, it is likely in millions or a bad field.
+        if ev < mc * 0.25 or ev > mc * 4.0:
+            return None
+    return ev
+
+
+def maybe_millions_to_dollars(value, reference_value=None):
+    """Some APIs, especially Finnhub metrics, return large fundamentals in millions."""
+    v = to_float(value)
+    ref = to_float(reference_value)
+    if v is None:
+        return None
+    if ref is not None and ref > 1e9 and v < ref * 0.01:
+        return v * 1_000_000
+    return v
+
+
 def pct_to_ratio(value):
     """Some APIs return 25 for 25%, others return 0.25. Convert to ratio when needed."""
     v = to_float(value)
@@ -985,6 +1047,11 @@ def fetch_price_data_yahoo(ticker, period):
 
 @st.cache_data(ttl=600)
 def fetch_yahoo_backup_fundamentals(ticker):
+    """Yahoo backup for ratios AND raw financial statements.
+
+    This is important because FMP plans/endpoints may return only partial data.
+    Yahoo statements often provide Revenue, EBITDA, Net Income, Debt, Cash, etc.
+    """
     try:
         tk = yf.Ticker(ticker)
         info = tk.info
@@ -997,6 +1064,83 @@ def fetch_yahoo_backup_fundamentals(ticker):
             fast_info.get("lastPrice"),
         )
 
+        # Yahoo financial statement backup
+        try:
+            income_stmt = tk.income_stmt
+        except Exception:
+            income_stmt = pd.DataFrame()
+
+        try:
+            balance_sheet = tk.balance_sheet
+        except Exception:
+            balance_sheet = pd.DataFrame()
+
+        try:
+            cashflow = tk.cashflow
+        except Exception:
+            cashflow = pd.DataFrame()
+
+        revenue_stmt = get_statement_value(
+            income_stmt,
+            ["Total Revenue", "Revenue", "Operating Revenue"]
+        )
+
+        ebitda_stmt = get_statement_value(
+            income_stmt,
+            ["EBITDA", "Normalized EBITDA"]
+        )
+
+        net_income_stmt = get_statement_value(
+            income_stmt,
+            ["Net Income", "Net Income Common Stockholders", "Net Income From Continuing Operation Net Minority Interest"]
+        )
+
+        operating_income_stmt = get_statement_value(
+            income_stmt,
+            ["Operating Income", "Operating Income Loss"]
+        )
+
+        total_debt_stmt = get_statement_value(
+            balance_sheet,
+            ["Total Debt", "Net Debt"]
+        )
+
+        # If Total Debt row is not available, add short-term + long-term debt rows when present.
+        if total_debt_stmt is None:
+            short_debt = get_statement_value(
+                balance_sheet,
+                ["Current Debt", "Current Debt And Capital Lease Obligation", "Short Long Term Debt"]
+            ) or 0
+            long_debt = get_statement_value(
+                balance_sheet,
+                ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"]
+            ) or 0
+            total_debt_stmt = short_debt + long_debt if (short_debt or long_debt) else None
+
+        cash_stmt = get_statement_value(
+            balance_sheet,
+            [
+                "Cash And Cash Equivalents",
+                "Cash Cash Equivalents And Short Term Investments",
+                "Cash Financial",
+            ]
+        )
+
+        da_stmt = get_statement_value(
+            cashflow,
+            ["Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation"]
+        )
+
+        ebitda_from_oi_da = calculate_ebitda(operating_income_stmt, da_stmt)
+
+        market_cap = first_non_none(info.get("marketCap"), fast_info.get("marketCap"))
+        total_debt = first_non_none(info.get("totalDebt"), total_debt_stmt)
+        cash = first_non_none(info.get("totalCash"), cash_stmt)
+        enterprise_value = valid_enterprise_value(info.get("enterpriseValue"), market_cap)
+
+        if enterprise_value is None:
+            enterprise_value = calculate_enterprise_value(market_cap, total_debt, cash)
+
         return {
             "source": "Yahoo Backup",
             "lastPrice": last_price,
@@ -1007,70 +1151,99 @@ def fetch_yahoo_backup_fundamentals(ticker):
             "earningsGrowth": info.get("earningsGrowth"),
             "revenueGrowth": info.get("revenueGrowth"),
             "ebitdaMargins": info.get("ebitdaMargins"),
-            "marketCap": first_non_none(info.get("marketCap"), fast_info.get("marketCap")),
+            "marketCap": market_cap,
             "sharesOutstanding": info.get("sharesOutstanding"),
             "beta": info.get("beta"),
             "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
             "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
-            "enterpriseValue": info.get("enterpriseValue"),
+            "enterpriseValue": enterprise_value,
             "enterpriseToEbitda": info.get("enterpriseToEbitda"),
-            "ebitda": info.get("ebitda"),
-            "totalDebt": info.get("totalDebt"),
-            "cash": info.get("totalCash"),
-            "netIncome": info.get("netIncomeToCommon"),
-            "revenue": info.get("totalRevenue"),
+            "ebitda": first_non_none(info.get("ebitda"), ebitda_stmt, ebitda_from_oi_da),
+            "operatingIncome": operating_income_stmt,
+            "depreciationAndAmortization": da_stmt,
+            "totalDebt": total_debt,
+            "cash": cash,
+            "netIncome": first_non_none(info.get("netIncomeToCommon"), net_income_stmt),
+            "revenue": first_non_none(info.get("totalRevenue"), revenue_stmt),
             "nextEarningsDate": fetch_earnings_date_yahoo(ticker),
         }
-    except Exception:
-        return {}
+    except Exception as e:
+        return {"source": "Yahoo Backup Error", "error": str(e)}
 
 
 @st.cache_data(ttl=600)
 def fetch_fmp_fundamentals(ticker, api_key):
-    """Fetch prebuilt ratios plus raw FMP financial-statement fields for manual fallback calculations."""
+    """Fetch FMP fundamentals using both newer stable endpoints and legacy v3 endpoints.
+
+    The stable endpoints have a different URL style than older v3 endpoints. This function
+    tries both so the app keeps working across FMP account/endpoint differences.
+    """
     if not api_key:
         return {}
 
     try:
         ticker = ticker.upper().strip()
-        base = "https://financialmodelingprep.com/api/v3"
+        stable = "https://financialmodelingprep.com/stable"
+        v3 = "https://financialmodelingprep.com/api/v3"
 
-        urls = {
-            "profile": f"{base}/profile/{ticker}?apikey={api_key}",
-            "quote": f"{base}/quote/{ticker}?apikey={api_key}",
-            "ratios": f"{base}/ratios-ttm/{ticker}?apikey={api_key}",
-            "metrics": f"{base}/key-metrics-ttm/{ticker}?apikey={api_key}",
-            "income": f"{base}/income-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
-            "balance": f"{base}/balance-sheet-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
-            "cashflow": f"{base}/cash-flow-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
-            "enterprise": f"{base}/enterprise-values/{ticker}?limit=1&apikey={api_key}",
-            "estimates": f"{base}/analyst-estimates/{ticker}?period=annual&limit=3&apikey={api_key}",
-            "earnings": f"{base}/earning_calendar?symbol={ticker}&limit=20&apikey={api_key}",
-        }
+        profile = get_json_first([
+            f"{stable}/profile?symbol={ticker}&apikey={api_key}",
+            f"{v3}/profile/{ticker}?apikey={api_key}",
+        ])
 
-        raw = {}
-        for key, url in urls.items():
-            data = fetch_json(url)
-            if key in ["estimates", "earnings"]:
-                raw[key] = data if isinstance(data, list) else []
-            else:
-                raw[key] = first_list_item(data)
+        quote = get_json_first([
+            f"{stable}/quote?symbol={ticker}&apikey={api_key}",
+            f"{v3}/quote/{ticker}?apikey={api_key}",
+        ])
 
-        profile = raw.get("profile", {}) or {}
-        quote = raw.get("quote", {}) or {}
-        ratios = raw.get("ratios", {}) or {}
-        metrics = raw.get("metrics", {}) or {}
-        income = raw.get("income", {}) or {}
-        balance = raw.get("balance", {}) or {}
-        cashflow = raw.get("cashflow", {}) or {}
-        enterprise = raw.get("enterprise", {}) or {}
-        estimates = raw.get("estimates", []) or []
-        earnings = raw.get("earnings", []) or []
+        ratios = get_json_first([
+            f"{stable}/ratios-ttm?symbol={ticker}&apikey={api_key}",
+            f"{v3}/ratios-ttm/{ticker}?apikey={api_key}",
+        ])
 
-        last_price = first_non_none(quote.get("price"), profile.get("price"))
+        metrics = get_json_first([
+            f"{stable}/key-metrics-ttm?symbol={ticker}&apikey={api_key}",
+            f"{v3}/key-metrics-ttm/{ticker}?apikey={api_key}",
+        ])
+
+        income = get_json_first([
+            f"{stable}/income-statement?symbol={ticker}&period=annual&limit=1&apikey={api_key}",
+            f"{v3}/income-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
+        ])
+
+        balance = get_json_first([
+            f"{stable}/balance-sheet-statement?symbol={ticker}&period=annual&limit=1&apikey={api_key}",
+            f"{v3}/balance-sheet-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
+        ])
+
+        cashflow = get_json_first([
+            f"{stable}/cash-flow-statement?symbol={ticker}&period=annual&limit=1&apikey={api_key}",
+            f"{v3}/cash-flow-statement/{ticker}?period=annual&limit=1&apikey={api_key}",
+        ])
+
+        enterprise = get_json_first([
+            f"{stable}/enterprise-values?symbol={ticker}&limit=1&apikey={api_key}",
+            f"{v3}/enterprise-values/{ticker}?limit=1&apikey={api_key}",
+        ])
+
+        estimates = get_json_list([
+            f"{stable}/analyst-estimates?symbol={ticker}&period=annual&limit=3&apikey={api_key}",
+            f"{v3}/analyst-estimates/{ticker}?period=annual&limit=3&apikey={api_key}",
+        ])
+
+        earnings = get_json_list([
+            f"{stable}/earnings-calendar?symbol={ticker}&limit=20&apikey={api_key}",
+            f"{stable}/earning-calendar?symbol={ticker}&limit=20&apikey={api_key}",
+            f"{v3}/earning_calendar?symbol={ticker}&limit=20&apikey={api_key}",
+        ])
+
+        last_price = first_non_none(
+            quote.get("price"), quote.get("previousClose"), profile.get("price")
+        )
 
         market_cap = first_non_none(
             profile.get("mktCap"),
+            profile.get("marketCap"),
             quote.get("marketCap"),
             metrics.get("marketCapTTM"),
             enterprise.get("marketCapitalization"),
@@ -1080,6 +1253,7 @@ def fetch_fmp_fundamentals(ticker, api_key):
         long_debt = to_float(balance.get("longTermDebt")) or 0
         total_debt = first_non_none(
             balance.get("totalDebt"),
+            balance.get("totalDebtTTM"),
             short_debt + long_debt if (short_debt or long_debt) else None,
         )
 
@@ -1087,18 +1261,18 @@ def fetch_fmp_fundamentals(ticker, api_key):
             balance.get("cashAndCashEquivalents"),
             balance.get("cashAndShortTermInvestments"),
             balance.get("cashAndCashEquivalentsAndShortTermInvestments"),
+            balance.get("cashCashEquivalentsAndShortTermInvestments"),
         )
 
         enterprise_value = first_non_none(
             enterprise.get("enterpriseValue"),
+            enterprise.get("enterpriseValueTTM"),
             metrics.get("enterpriseValueTTM"),
             metrics.get("enterpriseValue"),
         )
-
-        ebitda = first_non_none(
-            income.get("ebitda"),
-            metrics.get("ebitdaTTM"),
-        )
+        enterprise_value = valid_enterprise_value(enterprise_value, market_cap)
+        if enterprise_value is None:
+            enterprise_value = calculate_enterprise_value(market_cap, total_debt, cash)
 
         operating_income = first_non_none(
             income.get("operatingIncome"),
@@ -1108,13 +1282,26 @@ def fetch_fmp_fundamentals(ticker, api_key):
         depreciation_and_amortization = first_non_none(
             cashflow.get("depreciationAndAmortization"),
             cashflow.get("depreciationAndAmortizationExpense"),
+            cashflow.get("depreciationAmortizationDepletion"),
         )
 
+        ebitda = first_non_none(
+            income.get("ebitda"),
+            metrics.get("ebitdaTTM"),
+        )
         if ebitda is None:
             ebitda = calculate_ebitda(operating_income, depreciation_and_amortization)
 
-        net_income = first_non_none(income.get("netIncome"), income.get("netIncomeCommonStockholders"))
-        revenue = first_non_none(income.get("revenue"), metrics.get("revenueTTM"))
+        revenue = first_non_none(
+            income.get("revenue"),
+            income.get("totalRevenue"),
+            metrics.get("revenueTTM"),
+        )
+
+        net_income = first_non_none(
+            income.get("netIncome"),
+            income.get("netIncomeCommonStockholders"),
+        )
 
         trailing_pe = first_non_none(
             ratios.get("peRatioTTM"),
@@ -1129,6 +1316,14 @@ def fetch_fmp_fundamentals(ticker, api_key):
             ratios.get("enterpriseValueMultipleTTM"),
         )
 
+        # Reject absurd direct EV/EBITDA values.
+        ev_to_ebitda_val = to_float(ev_to_ebitda)
+        if ev_to_ebitda_val is not None and (ev_to_ebitda_val <= 0 or ev_to_ebitda_val > 200):
+            ev_to_ebitda = None
+
+        if ev_to_ebitda is None:
+            ev_to_ebitda = calculate_ev_to_ebitda(enterprise_value, ebitda)
+
         forward_eps = None
         if isinstance(estimates, list):
             for estimate in estimates:
@@ -1138,12 +1333,16 @@ def fetch_fmp_fundamentals(ticker, api_key):
                     estimate.get("estimatedEpsAvg"),
                     estimate.get("estimatedEpsHigh"),
                     estimate.get("estimatedEpsLow"),
+                    estimate.get("epsAvg"),
                 )
                 if possible_eps is not None and possible_eps > 0:
                     forward_eps = possible_eps
                     break
 
-        forward_pe = first_non_none(profile.get("priceEarningsRatio"))
+        forward_pe = first_non_none(
+            profile.get("priceEarningsRatio"),
+            ratios.get("forwardPERatioTTM"),
+        )
         if forward_pe is None and last_price is not None and forward_eps is not None and forward_eps > 0:
             forward_pe = last_price / forward_eps
 
@@ -1154,7 +1353,7 @@ def fetch_fmp_fundamentals(ticker, api_key):
             for e in earnings:
                 if not isinstance(e, dict):
                     continue
-                date_text = e.get("date")
+                date_text = first_non_empty(e.get("date"), e.get("fiscalDateEnding"))
                 if not date_text:
                     continue
                 try:
@@ -1180,8 +1379,8 @@ def fetch_fmp_fundamentals(ticker, api_key):
             "marketCap": market_cap,
             "sharesOutstanding": profile.get("sharesOutstanding"),
             "beta": profile.get("beta"),
-            "fiftyTwoWeekHigh": None,
-            "fiftyTwoWeekLow": None,
+            "fiftyTwoWeekHigh": quote.get("yearHigh"),
+            "fiftyTwoWeekLow": quote.get("yearLow"),
             "enterpriseValue": enterprise_value,
             "enterpriseToEbitda": ev_to_ebitda,
             "ebitda": ebitda,
@@ -1192,6 +1391,18 @@ def fetch_fmp_fundamentals(ticker, api_key):
             "netIncome": net_income,
             "peg": first_non_none(metrics.get("pegRatioTTM"), metrics.get("pegRatio")),
             "nextEarningsDate": next_earnings,
+            "rawFmpFieldsFound": {
+                "profile": bool(profile),
+                "quote": bool(quote),
+                "ratios": bool(ratios),
+                "metrics": bool(metrics),
+                "income": bool(income),
+                "balance": bool(balance),
+                "cashflow": bool(cashflow),
+                "enterprise": bool(enterprise),
+                "estimates": bool(estimates),
+                "earnings": bool(earnings),
+            }
         }
     except Exception as e:
         return {"source": "FMP Error", "error": str(e)}
@@ -1212,6 +1423,10 @@ def fetch_finnhub_fundamentals(ticker, api_key):
         data = response.json()
         metric = data.get("metric", {})
 
+        market_cap = None if metric.get("marketCapitalization") is None else metric.get("marketCapitalization") * 1_000_000
+        enterprise_value = maybe_millions_to_dollars(metric.get("enterpriseValue"), market_cap)
+        enterprise_value = valid_enterprise_value(enterprise_value, market_cap)
+
         return {
             "source": "Finnhub",
             "lastPrice": None,
@@ -1227,11 +1442,11 @@ def fetch_finnhub_fundamentals(ticker, api_key):
                 metric.get("revenueGrowth5Y")
             ),
             "ebitdaMargins": None if metric.get("ebitdaMarginTTM") is None else metric.get("ebitdaMarginTTM") / 100,
-            "marketCap": None if metric.get("marketCapitalization") is None else metric.get("marketCapitalization") * 1_000_000,
+            "marketCap": market_cap,
             "beta": metric.get("beta"),
             "fiftyTwoWeekHigh": metric.get("52WeekHigh"),
             "fiftyTwoWeekLow": metric.get("52WeekLow"),
-            "enterpriseValue": metric.get("enterpriseValue"),
+            "enterpriseValue": enterprise_value,
             "enterpriseToEbitda": metric.get("evToEbitda"),
             "ebitda": None,
             "totalDebt": None,
@@ -1241,6 +1456,7 @@ def fetch_finnhub_fundamentals(ticker, api_key):
         }
     except Exception:
         return {}
+
 
 
 def merge_fundamentals(fmp_data, finnhub_data, yahoo_backup):
@@ -1979,6 +2195,5 @@ with tab_scanner:
             ]
             existing_cols = [c for c in preferred_cols if c in universe_df.columns]
             st.dataframe(universe_df[existing_cols], use_container_width=True, hide_index=True)
-            
     else:
         st.info("Choose a universe and click Run Universe Scan.")
