@@ -1538,6 +1538,32 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
         ["Beta", fmt_num(beta, 3)],
     ], columns=["Metric", "Value"])
 
+    # This table is intentionally unformatted. It helps diagnose why a card is N/A.
+    # If a raw input is None here, the app did not receive that field from FMP/Finnhub/Yahoo.
+    raw_debug_table = pd.DataFrame(
+        [
+            ["Data Source", data.get("source_used")],
+            ["Last Close", latest_close],
+            ["Market Cap", market_cap],
+            ["Enterprise Value", enterprise_value],
+            ["Revenue", revenue],
+            ["EBITDA", ebitda],
+            ["Net Income", net_income],
+            ["Total Debt", total_debt],
+            ["Cash", cash],
+            ["Forward EPS", forward_eps],
+            ["Revenue Growth", revenue_growth],
+            ["EBITDA Margin", ebitda_margin],
+            ["Trailing P/E", trailing_pe],
+            ["Forward P/E", forward_pe],
+            ["EV / EBITDA", ev_to_ebitda],
+            ["PEG", peg],
+            ["Rule of 40", rule_of_40],
+            ["Next Earnings Date", earnings_date],
+        ],
+        columns=["Field", "Raw Value"]
+    )
+
     return {
         "ticker": ticker,
         "company_name": company_name,
@@ -1574,6 +1600,9 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
         "ebitda": ebitda,
         "net_income": net_income,
         "forward_eps": forward_eps,
+        "revenue_growth": revenue_growth,
+        "ebitda_margin": ebitda_margin,
+        "raw_debug_table": raw_debug_table,
         "implied_volatility": iv_data.get("implied_volatility"),
         "iv_percentile_approx": iv_data.get("iv_percentile_approx"),
         "iv_regime": iv_data.get("iv_regime"),
@@ -1718,6 +1747,21 @@ with tab_overview:
             with st.expander("Data Notes / Manual Ratio Fallbacks"):
                 for note in result["data_notes"]:
                     st.write(f"- {note}")
+
+        with st.expander("Raw Data Debug"):
+            st.caption(
+                "Use this section to diagnose N/A values. If Enterprise Value, EBITDA, "
+                "Revenue, Debt, Cash, Forward EPS, or Revenue Growth are blank/None here, "
+                "the data provider did not return enough raw data for that calculation."
+            )
+            st.write("**Result keys available in the app:**")
+            st.write(list(result.keys()))
+
+            raw_debug_table = result.get("raw_debug_table", pd.DataFrame())
+            if raw_debug_table is not None and not raw_debug_table.empty:
+                st.dataframe(raw_debug_table, use_container_width=True, hide_index=True)
+            else:
+                st.info("Raw debug table is not available for this ticker.")
 
         st.subheader("Decision Panel")
         d1, d2 = st.columns(2)
@@ -1935,5 +1979,6 @@ with tab_scanner:
             ]
             existing_cols = [c for c in preferred_cols if c in universe_df.columns]
             st.dataframe(universe_df[existing_cols], use_container_width=True, hide_index=True)
+            
     else:
         st.info("Choose a universe and click Run Universe Scan.")
