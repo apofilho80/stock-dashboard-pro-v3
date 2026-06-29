@@ -1909,6 +1909,8 @@ with tab_scanner:
                 "IV Rank", "IV Regime", "Setup Label", "Options Score",
                 "Valuation Style", "Trade Idea", "Fwd P/E", "PEG",
                 "Rule of 40", "Source"
+
+                
             ]
             existing_cols = [c for c in preferred_cols if c in universe_df.columns]
             st.dataframe(universe_df[existing_cols], use_container_width=True, hide_index=True)
