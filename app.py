@@ -1018,6 +1018,7 @@ def fetch_yahoo_backup_fundamentals(ticker):
             "totalDebt": info.get("totalDebt"),
             "cash": info.get("totalCash"),
             "netIncome": info.get("netIncomeToCommon"),
+            "revenue": info.get("totalRevenue"),
             "nextEarningsDate": fetch_earnings_date_yahoo(ticker),
         }
     except Exception:
@@ -1113,6 +1114,7 @@ def fetch_fmp_fundamentals(ticker, api_key):
             ebitda = calculate_ebitda(operating_income, depreciation_and_amortization)
 
         net_income = first_non_none(income.get("netIncome"), income.get("netIncomeCommonStockholders"))
+        revenue = first_non_none(income.get("revenue"), metrics.get("revenueTTM"))
 
         trailing_pe = first_non_none(
             ratios.get("peRatioTTM"),
@@ -1171,6 +1173,7 @@ def fetch_fmp_fundamentals(ticker, api_key):
             "forwardPE": forward_pe,
             "forwardEPS": forward_eps,
             "trailingEPS": first_non_none(income.get("eps"), income.get("epsdiluted")),
+            "revenue": revenue,
             "earningsGrowth": None,
             "revenueGrowth": first_non_none(metrics.get("revenueGrowth"), ratios.get("revenueGrowthTTM")),
             "ebitdaMargins": first_non_none(metrics.get("ebitdaMargin"), ratios.get("ebitdaMarginTTM")),
@@ -1216,6 +1219,7 @@ def fetch_finnhub_fundamentals(ticker, api_key):
             "forwardPE": None,
             "forwardEPS": None,
             "trailingEPS": metric.get("epsTTM"),
+            "revenue": None if metric.get("revenueTTM") is None else metric.get("revenueTTM") * 1_000_000,
             "earningsGrowth": None,
             "revenueGrowth": first_non_none(
                 metric.get("revenueGrowthTTM"),
@@ -1263,6 +1267,7 @@ def merge_fundamentals(fmp_data, finnhub_data, yahoo_backup):
 
     last_price = pv("lastPrice")
     market_cap = pv("marketCap")
+    revenue = pv("revenue")
     shares_outstanding = pv("sharesOutstanding")
 
     if market_cap is None and last_price is not None and shares_outstanding is not None:
@@ -1283,6 +1288,19 @@ def merge_fundamentals(fmp_data, finnhub_data, yahoo_backup):
         ebitda = calculate_ebitda(pv("operatingIncome"), pv("depreciationAndAmortization"))
         if ebitda is not None:
             notes.append("EBITDA calculated manually from Operating Income + Depreciation & Amortization.")
+
+    # Extra fallback: if EBITDA is still missing but revenue and EBITDA margin exist, estimate EBITDA.
+    # This is useful when a provider gives margins but not the absolute EBITDA number.
+    if ebitda is None:
+        revenue_val = to_float(revenue)
+        ebitda_margin_val = pct_to_ratio(first_non_none(
+            fmp_data.get("ebitdaMargins") if fmp_data else None,
+            finnhub_data.get("ebitdaMargins") if finnhub_data else None,
+            yahoo_backup.get("ebitdaMargins") if yahoo_backup else None,
+        ))
+        if revenue_val is not None and ebitda_margin_val is not None:
+            ebitda = revenue_val * ebitda_margin_val
+            notes.append("EBITDA estimated from Revenue × EBITDA Margin because absolute EBITDA was unavailable.")
 
     net_income = pv("netIncome")
     trailing_eps = pv("trailingEPS")
@@ -1344,6 +1362,7 @@ def merge_fundamentals(fmp_data, finnhub_data, yahoo_backup):
     audit_rows = [
         ["Last Price", fmt_num(last_price), "Provider"],
         ["Market Cap", fmt_large_number(market_cap), "Provider or manual Price × Shares"],
+        ["Revenue", fmt_large_number(revenue), "Provider"],
         ["Total Debt", fmt_large_number(total_debt), "Provider"],
         ["Cash", fmt_large_number(cash), "Provider"],
         ["Enterprise Value", fmt_large_number(enterprise_value), "Provider or manual Market Cap + Debt - Cash"],
@@ -1374,6 +1393,7 @@ def merge_fundamentals(fmp_data, finnhub_data, yahoo_backup):
         "revenueGrowth": revenue_growth,
         "ebitdaMargins": ebitda_margins,
         "marketCap": market_cap,
+        "revenue": revenue,
         "totalDebt": total_debt,
         "cash": cash,
         "enterpriseValue": enterprise_value,
@@ -1433,6 +1453,7 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
     cash = data.get("cash")
     enterprise_value = data.get("enterpriseValue")
     ebitda = data.get("ebitda")
+    revenue = data.get("revenue")
     net_income = data.get("netIncome")
     forward_eps = data.get("forwardEPS")
     beta = data.get("beta")
@@ -1499,6 +1520,7 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
         ["Data Source", data.get("source_used")],
         ["Next Earnings Date", earnings_date],
         ["Market Cap", fmt_large_number(market_cap)],
+        ["Revenue", fmt_large_number(revenue)],
         ["Enterprise Value", fmt_large_number(enterprise_value)],
         ["EBITDA", fmt_large_number(ebitda)],
         ["Net Income", fmt_large_number(net_income)],
@@ -1545,6 +1567,7 @@ def load_analysis(ticker, period, fmp_api_key, finnhub_api_key):
         "data_notes": data.get("notes", []),
         "audit_table": data.get("audit_table", pd.DataFrame()),
         "market_cap": market_cap,
+        "revenue": revenue,
         "total_debt": total_debt,
         "cash": cash,
         "enterprise_value": enterprise_value,
@@ -1909,8 +1932,6 @@ with tab_scanner:
                 "IV Rank", "IV Regime", "Setup Label", "Options Score",
                 "Valuation Style", "Trade Idea", "Fwd P/E", "PEG",
                 "Rule of 40", "Source"
-
-                
             ]
             existing_cols = [c for c in preferred_cols if c in universe_df.columns]
             st.dataframe(universe_df[existing_cols], use_container_width=True, hide_index=True)
