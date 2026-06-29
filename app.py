@@ -10,6 +10,9 @@ import streamlit as st
 FMP_API_KEY = st.secrets.get("FMP_API_KEY", "")
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 
+st.sidebar.caption(f"FMP key loaded: {'Yes' if FMP_API_KEY else 'No'}")
+st.sidebar.caption(f"Finnhub key loaded: {'Yes' if FINNHUB_API_KEY else 'No'}")
+
 # =========================
 # CONFIG
 # =========================
